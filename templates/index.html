@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>UWB Trilateration Map</title>
+  <style>
+    #mapCanvas {
+      border: 1px solid #000;
+    }
+  </style>
+  <script>
+    // 캔버스 전체 크기 (픽셀)
+    const canvasWidth = 800;
+    const canvasHeight = 500;
+
+    // 실제 테스트베드 크기 (미터)
+    const physicalWidth = 11.55;
+    const physicalHeight = 5.85;
+
+    // 배경 이미지를 그릴 때 유지하고 싶은 높이 (픽셀)
+    const desiredDrawingHeight = 300;
+    // 물리적 비율에 맞춰 너비 계산
+    const ratio = physicalWidth / physicalHeight;  // 약 1.974
+    const desiredDrawingWidth = desiredDrawingHeight * ratio;  // 약 592px
+
+    // 마진(이미지를 중앙에 배치하기 위해)
+    const marginX = (canvasWidth - desiredDrawingWidth) / 2;  // 약 104px
+    const marginY = (canvasHeight - desiredDrawingHeight) / 2; // 약 100px
+
+    // 물리 좌표 -> 픽셀 좌표 변환 스케일
+    const scaleX = desiredDrawingWidth / physicalWidth;
+    const scaleY = desiredDrawingHeight / physicalHeight;
+
+    // 마커 크기
+    const markerRadius = 5;
+
+    // 배경 이미지 경로 (static/test-bed.png)
+    const bgImageSrc = "{{ url_for('static', filename='test-bed.png') }}";
+    let bgImage = new Image();
+    bgImage.src = bgImageSrc;
+
+    // 물리 좌표를 캔버스 픽셀 좌표로 변환 (y축 반전 고려)
+    function physicalToPixel(x, y) {
+      return {
+        x: marginX + x * scaleX,
+        y: canvasHeight - marginY - (y * scaleY)
+      };
+    }
+
+    function updateMap() {
+      fetch("/data")
+        .then(response => response.json())
+        .then(data => {
+          const canvas = document.getElementById("mapCanvas");
+          const ctx = canvas.getContext("2d");
+
+          // 캔버스 초기화
+          ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+
+          // 배경 이미지 그리기 (가운데에)
+          ctx.drawImage(
+            bgImage,
+            marginX,
+            marginY,
+            desiredDrawingWidth,
+            desiredDrawingHeight
+          );
+
+          // 앵커 표시 (주황색 점)
+          const anchorPositions = data.anchor_positions;
+          for (const [anchorId, pos] of Object.entries(anchorPositions)) {
+            const pixelPos = physicalToPixel(pos[0], pos[1]);
+            ctx.beginPath();
+            ctx.arc(pixelPos.x, pixelPos.y, markerRadius, 0, 2 * Math.PI);
+            ctx.fillStyle = "orange";
+            ctx.fill();
+            // 앵커 ID 라벨
+            ctx.fillStyle = "black";
+            ctx.fillText(anchorId, pixelPos.x + markerRadius + 2, pixelPos.y - markerRadius - 2);
+          }
+
+          // 태그 표시 (파란색 점)
+          if (data.tag) {
+            const tagPixel = physicalToPixel(data.tag.x, data.tag.y);
+            ctx.beginPath();
+            ctx.arc(tagPixel.x, tagPixel.y, markerRadius, 0, 2 * Math.PI);
+            ctx.fillStyle = "blue";
+            ctx.fill();
+          }
+        })
+        .catch(error => console.error("Error fetching data:", error));
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      // 이미지 로드 완료 후 주기적 업데이트
+      bgImage.onload = function() {
+        updateMap();
+        setInterval(updateMap, 1000);
+      };
+    });
+  </script>
+</head>
+<body>
+  <h1>UWB Trilateration Map</h1>
+  <canvas id="mapCanvas" width="800" height="500"></canvas>
+</body>
+</html>
