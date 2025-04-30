@@ -2,11 +2,11 @@ from flask import Flask, render_template, jsonify
 import paho.mqtt.client as mqtt
 import json
 import time
-
+import numpy as np  # 파일 상단에 추가
 app = Flask(__name__)
 
 # MQTT 설정
-broker = "168.188.126.168"
+broker = "monetgpu1.duckdns.org"
 port = 1883
 topic = "esp32uwb/#"  # 모든 하위 토픽 구독
 
@@ -15,10 +15,12 @@ latest_data = {}
 
 # 고정된 앵커 위치 (물리 좌표, 단위: 미터)
 anchor_positions = {
-    "ANC3": (7.05, 5.85),
-    "ANC4": (11.55, 2.9),
+    "ANC7": (4.3, 0),
+    "ANC2": (4.3, 5.85),
+    "ANC4": (11.55, 3.0),
     "ANC6": (7.05, 0)
 }
+
 
 
 def on_message(client, userdata, msg):
@@ -27,11 +29,11 @@ def on_message(client, userdata, msg):
     try:
         data = json.loads(payload)
         anchor_id = data.get("anchor_id")
-        distance = data.get("distance")
-        if anchor_id in ["ANC3", "ANC4", "ANC6"]:
+        # 앵커 ID 조건: ANC0, ANC2, ANC4, ANC6
+        if anchor_id in ["ANC7", "ANC2", "ANC4", "ANC6"]:
             latest_data[anchor_id] = {
                 "anchor_id": anchor_id,
-                "distance": distance,
+                "distance": data.get("distance"),
                 "timestamp": time.time()
             }
     except json.JSONDecodeError:
@@ -60,33 +62,33 @@ client.loop_start()
 
 
 def compute_tag_position():
-    # 세 앵커의 데이터가 모두 있어야 계산 가능
-    if not all(anchor in latest_data for anchor in ["ANC3", "ANC4", "ANC6"]):
+    # 4 앵커(ANC0, ANC2, ANC4, ANC6)의 데이터가 모두 있어야 계산 가능
+    if not all(anchor in latest_data for anchor in ["ANC7", "ANC2", "ANC4", "ANC6"]):
         return None
     try:
-        r1 = float(latest_data["ANC3"]["distance"])
-        r2 = float(latest_data["ANC4"]["distance"])
-        r3 = float(latest_data["ANC6"]["distance"])
+        anchors = ["ANC7", "ANC2", "ANC4", "ANC6"]
+        distances = [float(latest_data[a]["distance"]) for a in anchors]
+        positions = [anchor_positions[a] for a in anchors]
 
-        (x1, y1) = anchor_positions["ANC3"]
-        (x2, y2) = anchor_positions["ANC4"]
-        (x3, y3) = anchor_positions["ANC6"]
+        # 기준 앵커(ANC0) 설정
+        x0, y0 = positions[0]
+        r0 = distances[0]
 
-        # 두 개의 원 방정식을 빼서 선형 방정식으로 변환
-        A = 2 * (x2 - x1)
-        B = 2 * (y2 - y1)
-        C = r1 ** 2 - r2 ** 2 - (x1 ** 2 - x2 ** 2) - (y1 ** 2 - y2 ** 2)
+        A = []
+        b = []
+        # 나머지 앵커(ANC2, ANC4, ANC6)에 대해 선형 방정식 구성
+        for i in range(1, 4):
+            xi, yi = positions[i]
+            ri = distances[i]
+            A.append([-2 * (xi - x0), -2 * (yi - y0)])
+            b.append(ri ** 2 - r0 ** 2 - (xi ** 2 - x0 ** 2) - (yi ** 2 - y0 ** 2))
 
-        D = 2 * (x3 - x1)
-        E = 2 * (y3 - y1)
-        F = r1 ** 2 - r3 ** 2 - (x1 ** 2 - x3 ** 2) - (y1 ** 2 - y3 ** 2)
+        A = np.array(A)
+        b = np.array(b)
 
-        denom = A * E - B * D
-        if abs(denom) < 1e-6:
-            return None
-
-        x = (C * E - B * F) / denom
-        y = (A * F - C * D) / denom
+        # 최소제곱법으로 해 구하기
+        sol, residuals, rank, s = np.linalg.lstsq(A, b, rcond=None)
+        x, y = sol[0], sol[1]
 
         return {"x": x, "y": y}
     except Exception as e:
