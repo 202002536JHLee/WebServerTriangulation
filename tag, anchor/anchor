@@ -1,0 +1,192 @@
+#include "dw3000.h"
+#include "SPI.h"
+
+extern SPISettings _fastSPI;
+
+#define PIN_RST 27
+#define PIN_IRQ 34
+#define PIN_SS 4
+
+#define TX_ANT_DLY 16385
+#define RX_ANT_DLY 16385
+#define ALL_MSG_COMMON_LEN 10
+#define ALL_MSG_SN_IDX 2  // 시퀀스 번호 시작 위치 (2바이트 사용)
+#define RESP_MSG_POLL_RX_TS_IDX 10
+#define RESP_MSG_RESP_TX_TS_IDX 14
+#define RESP_MSG_TS_LEN 4
+#define RANDOM_DELAY_IDX 18
+#define POLL_RX_TO_RESP_TX_DLY_UUS 11000
+#define ANCHOR_ID "ANC0"
+
+/* 랜덤 딜레이 범위 (500 ~ 8000us) */
+#define MIN_RESP_DELAY_UUS 600
+#define MAX_RESP_DELAY_UUS 10000
+
+/* Default communication configuration. */
+static dwt_config_t config = {
+    5,                /* Channel number. */
+    DWT_PLEN_512,     /* Preamble length. Used in TX only. */
+    DWT_PAC32,         /* Preamble acquisition chunk size. Used in RX only. */
+    9,                /* TX preamble code. Used in TX only. */
+    9,                /* RX preamble code. Used in RX only. */
+    1,                /* 0 to use standard 8 symbol SFD, 1 to use non-standard 8 symbol, 2 for non-standard 16 symbol SFD and 3 for 4z 8 symbol SDF type */
+    DWT_BR_850K,       /* Data rate. */
+    DWT_PHRMODE_STD,  /* PHY header mode. */
+    DWT_PHRRATE_STD,  /* PHY header rate. */
+    (513 + 8 - 32),    /* SFD timeout (preamble length + 1 + SFD length - PAC size). Used in RX only. */
+    DWT_STS_MODE_OFF, /* STS disabled */
+    DWT_STS_LEN_64,   /* STS length see allowed values in Enum dwt_sts_lengths_e */
+    DWT_PDOA_M0       /* PDOA mode off */
+};
+
+static uint8_t rx_poll_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'T', 'A', 'G', '0', 0xE0, 0, 0};
+static uint8_t tx_resp_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'A', 'N', 'C', '0', 0xE1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+static uint8_t rx_buffer[24];
+static uint32_t status_reg = 0;
+static uint64_t poll_rx_ts;
+static uint64_t resp_tx_ts;
+
+extern dwt_txconfig_t txconfig_options;
+
+void setup()
+{
+    UART_init();
+    _fastSPI = SPISettings(16000000L, MSBFIRST, SPI_MODE0);
+    spiBegin(PIN_IRQ, PIN_RST);
+    spiSelect(PIN_SS);
+    delay(2);  // DW3000 부팅 대기
+
+    // TX 전력 최대 설정
+    txconfig_options.PGdly = 0x34;
+    txconfig_options.power = 0xFFFFFFFF;  // 최대 전력 설정
+    txconfig_options.PGcount = 0x0;
+
+    while (!dwt_checkidlerc()) {
+        UART_puts("IDLE FAILED\r\n");
+        while (1);
+    }
+
+    if (dwt_initialise(DWT_DW_INIT) == DWT_ERROR) {
+        UART_puts("INIT FAILED\r\n");
+        while (1);
+    }
+
+    dwt_setleds(DWT_LEDS_ENABLE | DWT_LEDS_INIT_BLINK);
+
+    if (dwt_configure(&config)) {
+        UART_puts("CONFIG FAILED\r\n");
+        while (1);
+    }
+
+    dwt_configuretxrf(&txconfig_options);
+    dwt_setrxantennadelay(RX_ANT_DLY);
+    dwt_settxantennadelay(TX_ANT_DLY);
+    dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
+
+    Serial.println(ANCHOR_ID);
+    Serial.println("Setup Complete...");
+}
+
+void loop()
+{
+    /* RX 활성화 */
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+    /* Poll 메시지 수신 대기 */
+    while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) & (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_ERR))) {}
+
+    if (status_reg & SYS_STATUS_RXFCG_BIT_MASK)
+    {
+        uint32_t frame_len;
+        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+        frame_len = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+
+        if (frame_len <= sizeof(rx_buffer))
+        {
+            dwt_readrxdata(rx_buffer, frame_len, 0);
+
+            char tag_id[5];
+            memcpy(tag_id, &rx_buffer[5], 4);
+            tag_id[4] = '\0';
+
+            /* Poll 메시지 확인 (시퀀스 번호 제외) */
+            if (memcmp(rx_buffer, rx_poll_msg, ALL_MSG_SN_IDX) == 0 &&
+                memcmp(rx_buffer + ALL_MSG_SN_IDX + 2, rx_poll_msg + ALL_MSG_SN_IDX + 2, ALL_MSG_COMMON_LEN - (ALL_MSG_SN_IDX + 2)) == 0)
+            {
+                int ret;
+
+                /* Poll 수신 시간 기록 */
+                poll_rx_ts = get_rx_timestamp_u64();
+
+                /* 랜덤한 응답 지연 생성 (500 ~ 10000us) */
+                uint32_t random_resp_delay = random(MIN_RESP_DELAY_UUS, MAX_RESP_DELAY_UUS);
+                uint32_t random_resp_delay_dwt = (uint64_t)random_resp_delay * (uint64_t)UUS_TO_DWT_TIME;
+
+                Serial.print("🕒 랜덤 딜레이: "); Serial.print(random_resp_delay); Serial.println(" us");
+                Serial.print("🕒 랜덤 딜레이 DWT 단위: "); Serial.println(random_resp_delay_dwt);
+
+                /* 응답 전송 시간 설정 */
+                uint32_t resp_tx_time = (poll_rx_ts + (POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8;
+                //uint32_t resp_tx_time = (poll_rx_ts + random_resp_delay_dwt) >> 8;
+                uint32_t delay = POLL_RX_TO_RESP_TX_DLY_UUS;
+                dwt_setdelayedtrxtime(resp_tx_time);
+
+                /* 응답 메시지의 타임스탬프 설정 */
+                resp_tx_ts = (((uint64_t)(resp_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY ;
+                resp_msg_set_ts(&tx_resp_msg[RESP_MSG_POLL_RX_TS_IDX], poll_rx_ts);
+                resp_msg_set_ts(&tx_resp_msg[RESP_MSG_RESP_TX_TS_IDX], resp_tx_ts);
+
+                // ✅ `memcpy()`로 랜덤 딜레이 값을 저장
+                memcpy(&tx_resp_msg[RANDOM_DELAY_IDX], &delay, sizeof(delay));
+                //memcpy(&tx_resp_msg[RANDOM_DELAY_IDX], &random_resp_delay, sizeof(random_resp_delay));
+
+                /* Poll 메시지의 시퀀스 번호(2바이트)를 Resp 메시지에 적용 */
+                tx_resp_msg[ALL_MSG_SN_IDX] = rx_buffer[ALL_MSG_SN_IDX];      // 상위 바이트
+                tx_resp_msg[ALL_MSG_SN_IDX + 1] = rx_buffer[ALL_MSG_SN_IDX + 1];  // 하위 바이트
+
+                /* Resp 메시지 전송 */
+                dwt_writetxdata(sizeof(tx_resp_msg), tx_resp_msg, 0);
+                dwt_writetxfctrl(sizeof(tx_resp_msg), 0, 1);
+                dwt_setdelayedtrxtime(resp_tx_time);
+                ret = dwt_starttx(DWT_START_TX_DELAYED);
+
+                // ✅ 앵커 코드에서 디버깅 출력 추가
+                Serial.print("📏 예상된 resp_tx_ts: ");
+                Serial.println(poll_rx_ts + delay);
+                Serial.print("📏 실제 resp_tx_ts: ");
+                Serial.println(resp_tx_ts);
+
+                Serial.print("📏 poll_rx_ts: "); Serial.println(poll_rx_ts);
+                Serial.print("📏 resp_tx_ts: "); Serial.println(resp_tx_ts);
+                Serial.print("📏 실제 설정된 딜레이: "); Serial.println(resp_tx_ts - poll_rx_ts);
+                Serial.print("📏 기대했던 딜레이: "); Serial.println(POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME);
+
+
+                if (ret == DWT_SUCCESS)
+                {
+                    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) {}
+                    // ✅ TX 완료 후 정확한 타임스탬프 읽기
+                      uint8_t full_resp_tx_ts[5];
+                      dwt_readtxtimestamp(full_resp_tx_ts);
+                      uint64_t actual_resp_tx_ts = ((uint64_t)full_resp_tx_ts[4] << 32) |
+                                                  ((uint64_t)full_resp_tx_ts[3] << 24) |
+                                                  ((uint64_t)full_resp_tx_ts[2] << 16) |
+                                                  ((uint64_t)full_resp_tx_ts[1] << 8)  |
+                                                  ((uint64_t)full_resp_tx_ts[0]);
+
+                      // TX 완료 플래그 클리어
+                      dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+
+                      // ✅ TX 완료 후 정확한 타임스탬프 확인
+                      Serial.print("1 예상된 resp_tx_ts: "); Serial.println(resp_tx_ts);
+                      Serial.print("2 실제 resp_tx_ts: "); Serial.println(actual_resp_tx_ts);
+
+                }
+            }
+        }
+    }
+    else
+    {
+        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+    }
+}

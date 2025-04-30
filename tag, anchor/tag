@@ -1,0 +1,285 @@
+#include "dw3000.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+/* UWB 핀 할당 */
+#define PIN_RST 27
+#define PIN_IRQ 34
+#define PIN_SS 4
+
+/* MQTT 전송 주기 */
+#define MQTT_DELAY_MS 500   // 0.5초
+#define RNG_DELAY_MS 250    // 0.25초 (UWB Poll 전송 주기)
+
+/* 안테나 지연 */
+#define TX_ANT_DLY 16385
+#define RX_ANT_DLY 16385
+
+/* 메시지 인덱스 */
+#define ALL_MSG_COMMON_LEN 10
+#define ALL_MSG_SN_IDX 2
+#define RESP_MSG_POLL_RX_TS_IDX 10
+#define RESP_MSG_RESP_TX_TS_IDX 14
+#define RESP_MSG_TS_LEN 4
+
+/* 타이밍 설정 */
+#define POLL_TX_TO_RESP_RX_DLY_UUS 240
+#define RESP_RX_TIMEOUT_UUS 30000
+
+/* 앵커 관리 */
+#define MAX_ANCHORS 10
+#define SEQ_THRESHOLD 3
+#define DROP_THRESHOLD 50
+
+/* Wi-Fi 및 MQTT 설정 */
+const char* ssid        = "monet2g";
+const char* password    = "monet1234";
+const char* mqtt_broker = "monetgpu1.duckdns.org";
+const int   mqtt_port   = 1883;
+const char* mqtt_topic  = "esp32uwb/distance1";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+/* DW3000 설정 구조체 */
+static dwt_config_t config = {
+    5,                       // 채널 번호 (chan)
+    DWT_PLEN_512,            // TX 프리앰블 길이 (txPreambLength)
+    DWT_PAC32,               // RX 프리앰블 획득 청크 크기 (rxPAC)
+    9,                       // TX 프리앰블 코드 (txCode)
+    9,                       // RX 프리앰블 코드 (rxCode)
+    1,                       // 비표준 SFD 유형 (nsSFD: 0–3)
+    DWT_BR_850K,             // 데이터 전송률 (dataRate)
+    DWT_PHRMODE_STD,         // PHY 헤더 모드 (phrMode)
+    DWT_PHRRATE_STD,         // PHY 헤더 전송률 (phrRate)
+    (513 + 8 - 32),          // SFD 타임아웃 (sfdTO)
+    DWT_STS_MODE_OFF,        // STS 모드 (stsMode)
+    DWT_STS_LEN_64,          // STS 길이 (stsLength)
+    DWT_PDOA_M0              // PDOA 모드 (pdoaMode)
+};
+
+/* Poll 메시지 및 버퍼 */
+static uint8_t  tx_poll_msg[] = { 0x41,0x88,0,0xCA,0xDE,'T','A','G','0',0xE0,0,0 };
+static uint8_t  rx_buffer[24];
+static uint16_t frame_seq_nb  = 0;
+static uint32_t status_reg    = 0;
+
+/* 앵커 정보 구조체 */
+typedef struct {
+    char     anchor_id[5];
+    double   distance;
+    uint16_t seq_num;
+    bool     active;
+} AnchorInfo;
+
+/* 앵커 테이블 */
+static AnchorInfo anchor_table[MAX_ANCHORS] = {0};
+static int        anchor_count               = 0;
+
+/* 외부 TX 설정 참조 */
+extern dwt_txconfig_t txconfig_options;
+
+/* 함수 선언 */
+void setup_wifi();
+void reconnect_mqtt();
+void send_anchor_data(const char* anchor_id, double distance);
+void UWBTask(void* pvParameters);
+void MQTTTask(void* pvParameters);
+void send_poll();
+void update_anchor_table(const char* anchor_id, double distance, uint16_t seq_num);
+void receive_responses();
+void check_anchor_status();
+void print_anchor_table();
+
+void setup() {
+    Serial.begin(115200);
+    UART_init();
+    spiBegin(PIN_IRQ, PIN_RST);
+    spiSelect(PIN_SS);
+    delay(2);
+
+    // TX 전력 최대 설정
+    txconfig_options.PGdly   = 0x34;
+    txconfig_options.power   = 0xFFFFFFFF;
+    txconfig_options.PGcount = 0x0;
+
+    // DW3000 초기화
+    while (!dwt_checkidlerc());
+    if (dwt_initialise(DWT_DW_INIT) == DWT_ERROR) { while (1); }
+    dwt_setleds(DWT_LEDS_ENABLE | DWT_LEDS_INIT_BLINK);
+    if (dwt_configure(&config)) { while (1); }
+    dwt_setrxantennadelay(RX_ANT_DLY);
+    dwt_settxantennadelay(TX_ANT_DLY);
+    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
+    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
+    dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
+
+    // Wi-Fi & MQTT 초기화
+    setup_wifi();
+    client.setServer(mqtt_broker, mqtt_port);
+
+    Serial.println("Setup Complete");
+
+    // FreeRTOS 태스크 시작
+    xTaskCreatePinnedToCore(MQTTTask, "WiFi_MQTT_Task", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(UWBTask,     "UWB_Task",      4096, NULL, 1, NULL, 1);
+}
+
+void loop() {
+    vTaskDelete(NULL);
+}
+
+// Wi-Fi 연결
+void setup_wifi() {
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi Connected, IP: " + WiFi.localIP().toString());
+}
+
+// MQTT 재연결
+void reconnect_mqtt() {
+    while (!client.connected()) {
+        if (client.connect("ESP32_UWB")) {
+            Serial.println("MQTT Connected!");
+        } else {
+            Serial.print("MQTT Conn Failed, rc=");
+            Serial.print(client.state());
+            Serial.println(" Retry in 5s");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        }
+    }
+}
+
+// JSON 페이로드 전송
+void send_anchor_data(const char* anchor_id, double distance) {
+    if (!client.connected()) {
+        reconnect_mqtt();
+    }
+    char payload[100];
+    snprintf(payload, sizeof(payload),
+             "{\"anchor_id\":\"%s\",\"distance\":%.2f}",
+             anchor_id, distance);
+    client.publish(mqtt_topic, payload);
+    Serial.println("Sent: " + String(payload));
+}
+
+// UWB 태스크
+void UWBTask(void* pvParameters) {
+    while (1) {
+        send_poll();
+        receive_responses();
+        check_anchor_status();
+        print_anchor_table();
+        vTaskDelay(pdMS_TO_TICKS(RNG_DELAY_MS));
+    }
+}
+
+// MQTT 태스크
+void MQTTTask(void* pvParameters) {
+    reconnect_mqtt();
+    while (1) {
+        client.loop();
+        for (int i = 0; i < anchor_count; i++) {
+            send_anchor_data(anchor_table[i].anchor_id,
+                             anchor_table[i].distance);
+        }
+        vTaskDelay(pdMS_TO_TICKS(MQTT_DELAY_MS));
+    }
+}
+
+// Poll 메시지 전송
+void send_poll() {
+    tx_poll_msg[ALL_MSG_SN_IDX]     = (frame_seq_nb >> 8) & 0xFF;
+    tx_poll_msg[ALL_MSG_SN_IDX + 1] =  frame_seq_nb       & 0xFF;
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+    dwt_writetxdata(sizeof(tx_poll_msg), tx_poll_msg, 0);
+    dwt_writetxfctrl(sizeof(tx_poll_msg), 0, 1);
+    dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
+    frame_seq_nb++;
+}
+
+// 앵커 테이블 업데이트
+void update_anchor_table(const char* anchor_id, double distance, uint16_t seq_num) {
+    for (int i = 0; i < anchor_count; i++) {
+        if (strcmp(anchor_table[i].anchor_id, anchor_id) == 0) {
+            anchor_table[i].distance = distance;
+            anchor_table[i].active   = ((int16_t)(seq_num - anchor_table[i].seq_num) < SEQ_THRESHOLD);
+            anchor_table[i].seq_num  = seq_num;
+            return;
+        }
+    }
+    if (anchor_count < MAX_ANCHORS) {
+        strncpy(anchor_table[anchor_count].anchor_id, anchor_id, 4);
+        anchor_table[anchor_count].anchor_id[4] = '\0';
+        anchor_table[anchor_count].distance     = distance;
+        anchor_table[anchor_count].seq_num      = seq_num;
+        anchor_table[anchor_count].active       = true;
+        anchor_count++;
+    }
+}
+
+// 응답 수신
+void receive_responses() {
+    unsigned long start = millis();
+    while (millis() - start < RESP_RX_TIMEOUT_UUS / 1000) {
+        status_reg = dwt_read32bitreg(SYS_STATUS_ID);
+        if (status_reg & SYS_STATUS_RXFCG_BIT_MASK) {
+            uint32_t len = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+            if (len <= sizeof(rx_buffer)) {
+                dwt_readrxdata(rx_buffer, len, 0);
+                char anchor_id[5];
+                memcpy(anchor_id, &rx_buffer[5], 4);
+                anchor_id[4] = '\0';
+                uint16_t seq = (rx_buffer[ALL_MSG_SN_IDX] << 8) |
+                                rx_buffer[ALL_MSG_SN_IDX + 1];
+                uint32_t poll_tx_ts = dwt_readtxtimestamplo32();
+                uint32_t resp_rx_ts = dwt_readrxtimestamplo32();
+                uint32_t poll_rx_ts, resp_tx_ts, rnd_delay;
+                resp_msg_get_ts(&rx_buffer[RESP_MSG_POLL_RX_TS_IDX], &poll_rx_ts);
+                resp_msg_get_ts(&rx_buffer[RESP_MSG_RESP_TX_TS_IDX], &resp_tx_ts);
+                memcpy(&rnd_delay,
+                       &rx_buffer[RESP_MSG_RESP_TX_TS_IDX + RESP_MSG_TS_LEN],
+                       sizeof(rnd_delay));
+                uint32_t rnd_dwt = (uint64_t)rnd_delay * UUS_TO_DWT_TIME;
+                float clkOff = ((float)dwt_readclockoffset()) / (1UL<<26);
+                double tof = ((resp_rx_ts - poll_tx_ts)
+                            - (resp_tx_ts - poll_rx_ts) * (1 - clkOff)) / 2.0 * DWT_TIME_UNITS;
+                double distance = tof * SPEED_OF_LIGHT;
+                if (distance < 0.1) distance = 0.1;
+                if (distance > 500 ) distance = 500;
+                update_anchor_table(anchor_id, distance, seq);
+                dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            }
+        } else {
+            dwt_write32bitreg(SYS_STATUS_ID,
+                SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        }
+    }
+}
+
+// 상태 점검
+void check_anchor_status() {
+    for (int i = 0; i < anchor_count; i++) {
+        if ((int16_t)(frame_seq_nb - anchor_table[i].seq_num) >= SEQ_THRESHOLD)
+            anchor_table[i].active = false;
+    }
+}
+
+// 테이블 출력
+void print_anchor_table() {
+    Serial.println("\n=== UWB Anchor Table ===");
+    for (int i = 0; i < anchor_count; i++) {
+        Serial.printf("%s: %.2f m, Seq: %d, Active: %s\n",
+            anchor_table[i].anchor_id,
+            anchor_table[i].distance,
+            anchor_table[i].seq_num,
+            anchor_table[i].active ? "Yes" : "No");
+    }
+    Serial.println("========================");
+}
