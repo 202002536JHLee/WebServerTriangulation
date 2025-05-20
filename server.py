@@ -2,112 +2,122 @@ from flask import Flask, render_template, jsonify
 import paho.mqtt.client as mqtt
 import json
 import time
-import numpy as np  # 파일 상단에 추가
+import numpy as np
+import psycopg2
+from datetime import datetime
+import threading  # ✅ 주기 저장용 스레드
+
 app = Flask(__name__)
 
 # MQTT 설정
 broker = "monetgpu1.duckdns.org"
 port = 1883
-topic = "esp32uwb/#"  # 모든 하위 토픽 구독
+topic = "esp32uwb/#"
 
-# 각 앵커의 최신 데이터를 저장하는 딕셔너리
 latest_data = {}
 
-# 고정된 앵커 위치 (물리 좌표, 단위: 미터)
+# 앵커 좌표
 anchor_positions = {
-    "ANC7": (4.3, 0),
-    "ANC2": (4.3, 5.85),
-    "ANC4": (11.55, 3.0),
-    "ANC6": (7.05, 0)
+    "ANC0": (0.54,  1.4),
+    "ANC2": (4.3,   5.85),
+    "ANC4": (11.55, 2.7),
+    "ANC6": (7.05,  0.0)
 }
 
-
-
+# MQTT 메시지 수신 처리
 def on_message(client, userdata, msg):
-    payload = msg.payload.decode("utf-8")
-    print(f"Received from {msg.topic}: {payload}")
     try:
-        data = json.loads(payload)
-        anchor_id = data.get("anchor_id")
-        # 앵커 ID 조건: ANC0, ANC2, ANC4, ANC6
-        if anchor_id in ["ANC7", "ANC2", "ANC4", "ANC6"]:
-            latest_data[anchor_id] = {
-                "anchor_id": anchor_id,
-                "distance": data.get("distance"),
+        data = json.loads(msg.payload.decode())
+        aid = data.get("anchor_id")
+        if aid in anchor_positions:
+            latest_data[aid] = {
+                "distance": float(data.get("distance")),
+                "rssi": float(data.get("rssi")),
                 "timestamp": time.time()
             }
-    except json.JSONDecodeError:
-        print("Invalid JSON format")
-
+    except Exception:
+        pass
 
 client = mqtt.Client()
 client.on_message = on_message
 
-
 def connect_mqtt():
     while True:
         try:
-            print("Attempting to connect to MQTT broker...")
             client.connect(broker, port)
-            print("Connected to MQTT broker")
+            client.subscribe(topic)
+            client.loop_start()
             break
-        except Exception as e:
-            print(f"Connection failed: {e}")
+        except Exception:
             time.sleep(5)
 
-
 connect_mqtt()
-client.subscribe(topic)
-client.loop_start()
 
-
-def compute_tag_position():
-    # 4 앵커(ANC0, ANC2, ANC4, ANC6)의 데이터가 모두 있어야 계산 가능
-    if not all(anchor in latest_data for anchor in ["ANC7", "ANC2", "ANC4", "ANC6"]):
-        return None
+# PostgreSQL 저장 함수
+def insert_to_db():
     try:
-        anchors = ["ANC7", "ANC2", "ANC4", "ANC6"]
-        distances = [float(latest_data[a]["distance"]) for a in anchors]
-        positions = [anchor_positions[a] for a in anchors]
+        conn = psycopg2.connect(
+            host="168.188.128.82",
+            port=5432,
+            dbname="ljh_uwb",
+            user="gpuadmin",
+            password="monet1234"
+        )
+        cur = conn.cursor()
 
-        # 기준 앵커(ANC0) 설정
-        x0, y0 = positions[0]
-        r0 = distances[0]
+        sql = """
+        INSERT INTO fingerprinting (
+            rssi_anc0, rssi_anc2, rssi_anc4, rssi_anc6,
+            distance_anc0, distance_anc2, distance_anc4, distance_anc6,
+            tag_position, timestamp
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+        """
 
-        A = []
-        b = []
-        # 나머지 앵커(ANC2, ANC4, ANC6)에 대해 선형 방정식 구성
-        for i in range(1, 4):
-            xi, yi = positions[i]
-            ri = distances[i]
-            A.append([-2 * (xi - x0), -2 * (yi - y0)])
-            b.append(ri ** 2 - r0 ** 2 - (xi ** 2 - x0 ** 2) - (yi ** 2 - y0 ** 2))
+        def get_val(a, key):
+            return latest_data.get(a, {}).get(key, None)
 
-        A = np.array(A)
-        b = np.array(b)
+        cur.execute(sql, (
+            get_val("ANC0", "rssi"),
+            get_val("ANC2", "rssi"),
+            get_val("ANC4", "rssi"),
+            get_val("ANC6", "rssi"),
+            get_val("ANC0", "distance"),
+            get_val("ANC2", "distance"),
+            get_val("ANC4", "distance"),
+            get_val("ANC6", "distance"),
+            json.dumps({"x": 0, "y": 0}),
+            datetime.now()
+        ))
 
-        # 최소제곱법으로 해 구하기
-        sol, residuals, rank, s = np.linalg.lstsq(A, b, rcond=None)
-        x, y = sol[0], sol[1]
-
-        return {"x": x, "y": y}
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("[DB] 1초 주기 저장 완료")
     except Exception as e:
-        print(f"Error in trilateration: {e}")
-        return None
+        print("[DB ERROR]", e)
 
+# ✅ 1초 주기 자동 저장 스레드
+def auto_save_loop():
+    while True:
+        if latest_data:  # 데이터가 존재할 때만 저장
+            insert_to_db()
+        time.sleep(1)  # 1초 간격
 
+# Flask 기본 페이지
 @app.route("/")
 def index():
     return render_template("index.html")
 
+# 데이터 반환 API
 @app.route("/data")
 def get_data():
-    tag_position = compute_tag_position()
     return jsonify({
         "anchors": latest_data,
-        "tag": tag_position,
+        "tag": None,
         "anchor_positions": anchor_positions
     })
 
 if __name__ == "__main__":
+    # ✅ 백그라운드 저장 스레드 시작
+    threading.Thread(target=auto_save_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
