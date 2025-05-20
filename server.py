@@ -5,7 +5,7 @@ import time
 import numpy as np
 import psycopg2
 from datetime import datetime
-import threading  # ✅ 주기 저장용 스레드
+import threading
 
 app = Flask(__name__)
 
