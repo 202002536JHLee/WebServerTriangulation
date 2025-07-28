@@ -53,6 +53,51 @@ def connect_mqtt():
 
 connect_mqtt()
 
+# 칼만 필터 정의
+class KalmanFilter:
+    def __init__(self, trust=0.5):
+        self.value = None
+        self.trust = trust
+
+    def update(self, measured):
+        if self.value is None:
+            self.value = measured
+        else:
+            self.value += self.trust * (measured - self.value)
+        return self.value
+
+kf_x = KalmanFilter()
+kf_y = KalmanFilter()
+
+# 태그 위치 계산 함수
+def compute_tag_position():
+    if not all(a in latest_data for a in anchor_positions):
+        return None
+    anchors = list(anchor_positions.keys())
+    distances = [latest_data[a]["distance"] for a in anchors]
+    coords = [anchor_positions[a] for a in anchors]
+
+    # 기준 앵커
+    x0, y0 = coords[0]
+    r0 = distances[0]
+
+    # Ax = b 형태로 변환
+    A = []
+    b = []
+    for (xi, yi), ri in zip(coords[1:], distances[1:]):
+        A.append([-2*(xi-x0), -2*(yi-y0)])
+        b.append(ri**2 - r0**2 - (xi**2 - x0**2) - (yi**2 - y0**2))
+    A = np.array(A)
+    b = np.array(b)
+
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    x_raw, y_raw = sol[0], sol[1]
+
+    # 칼만 필터 적용
+    x_f = kf_x.update(x_raw)
+    y_f = kf_y.update(y_raw)
+    return {"x": x_f, "y": y_f}
+
 # PostgreSQL 저장 함수
 def insert_to_db():
     try:
@@ -66,7 +111,7 @@ def insert_to_db():
         cur = conn.cursor()
 
         sql = """
-        INSERT INTO fingerprinting (
+        INSERT INTO test_fingerprinting (
             rssi_anc0, rssi_anc2, rssi_anc4, rssi_anc6,
             distance_anc0, distance_anc2, distance_anc4, distance_anc6,
             tag_position, timestamp
@@ -75,6 +120,9 @@ def insert_to_db():
 
         def get_val(a, key):
             return latest_data.get(a, {}).get(key, None)
+
+        # 태그 위치는 하드코딩 (실제 위치)
+        placeholder = json.dumps({"x": 11.25, "y": 4.95})
 
         cur.execute(sql, (
             get_val("ANC0", "rssi"),
@@ -85,7 +133,7 @@ def insert_to_db():
             get_val("ANC2", "distance"),
             get_val("ANC4", "distance"),
             get_val("ANC6", "distance"),
-            json.dumps({"x": 0, "y": 0}),
+            placeholder,
             datetime.now()
         ))
 
@@ -96,12 +144,12 @@ def insert_to_db():
     except Exception as e:
         print("[DB ERROR]", e)
 
-# ✅ 1초 주기 자동 저장 스레드
+# 1초 주기 자동 저장 스레드
 def auto_save_loop():
     while True:
-        if latest_data:  # 데이터가 존재할 때만 저장
+        if latest_data:
             insert_to_db()
-        time.sleep(1)  # 1초 간격
+        time.sleep(0.5)
 
 # Flask 기본 페이지
 @app.route("/")
@@ -113,11 +161,10 @@ def index():
 def get_data():
     return jsonify({
         "anchors": latest_data,
-        "tag": None,
+        "tag": compute_tag_position(),
         "anchor_positions": anchor_positions
     })
 
 if __name__ == "__main__":
-    # ✅ 백그라운드 저장 스레드 시작
     threading.Thread(target=auto_save_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
